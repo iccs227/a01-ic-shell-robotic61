@@ -8,26 +8,40 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 #define MAX_CMD_BUFFER 255
 #define MAX_ARGS 128 // for number of arguments(external command)
 
-void runCmd(char *cmd, char last_cmd[], char buffer[]);
-void scriptMode(const char *filename);
-// 	A pointer to read-only string data.
-void interactiveMode();
-void prompt();
-int handleHistory(char buffer[], char last_cmd[]);
-// declare the functions on top so main can see.
+pid_t fg_pid = -1; // stores the PID of the child process(-1 is never a valid PID 
+//meaning no child process now)
+int last_status = 0;
+// for built-in commands we do not update last_statusm so it stays at 0.
+// only the child process will update the last_status.
 
-int main(int argc, char *argv[]) {
-    if (argc == 2) {
-        scriptMode(argv[1]);
-    } else {
-        interactiveMode();
+void handle_sigint(int sig) {
+    if (fg_pid > 0) {
+        printf("\n");
+        kill(fg_pid, SIGINT);
     }
-    return 0;
-    // program exits after script mode (return 0 = exit(0))
+    else { // only print prompt if no child is running.
+        printf("\nicsh $ ");
+        fflush(stdout);
+        // After the signal handler runs, it resumes exactly where it was interrupted.
+        // so continues at fgets().
+    }
+    // if signal sent and there is no child process we do nothing(go back to prompt).
+}
+
+void handle_sigtstp(int sig) {
+    if (fg_pid > 0) {
+        printf("\n");
+        kill(fg_pid, SIGTSTP);
+    }
+    else { // only print prompt if no child is running.
+        printf("\nicsh $ ");
+        fflush(stdout);
+    }
 }
 
 void prompt() {
@@ -53,6 +67,12 @@ int handleHistory(char buffer[], char last_cmd[]) {
 void runCmd(char *cmd, char last_cmd[], char buffer[]) {
     if (strcmp(cmd, "echo") == 0) {
         char *next = strtok(NULL, " ");
+
+        if (next && strcmp(next, "$?") == 0) {
+            printf("%d\n", last_status);
+            return; // exits the function early(does not return anything)
+        }
+
         while (next != NULL) {
             printf("%s ", next);
             next = strtok(NULL, " ");
@@ -95,16 +115,40 @@ void runCmd(char *cmd, char last_cmd[], char buffer[]) {
     }
 
     else if (pid > 0) {
+        fg_pid = pid;
+        // set 
         int status;
-        // stores the exit status of the child process.
-        waitpid(pid, &status, 0);
+        // stores an integer of how the child process terminates.
+        waitpid(pid, &status, WUNTRACED); // set instead of default to WUNTRACED.
+        // parent waits for child to either exit normally or get suspended.
+        // now the child stays suspended and parent gain control of the terminal.
+        // so prompt can return right away and dont have to wait for the 
+        // SUSPENDED child process.
         // wait for the child process to finish to continue.
         // use 0 for default behavior.
+
+        fg_pid = -1; // PREPARE TO CHANGE THIS to resume the child process.
+
+        // resets the fg_pid back to -1 after the child finishes(no more child process)
+
+        if (WIFEXITED(status)) {
+            // true if the child exited normally
+            last_status = WEXITSTATUS(status);
+            // returns the exit code of the child
+        }
+
+        else {
+            last_status = 1;
+        }
+
     }
 
-    else {
-        perror("failed to fork");
-    } 
+        else {
+            // for the case where fork returns -1, meaning the process creation failed.
+            perror("failed to fork");
+            last_status = 1;
+            // 1 means error.
+        }
 
 }
 
@@ -153,4 +197,19 @@ void interactiveMode() {
 
         runCmd(cmd, last_cmd, buffer);
     }
+}
+
+int main(int argc, char *argv[]) {
+    signal(SIGINT, handle_sigint);
+    signal(SIGTSTP, handle_sigtstp);
+    // we put signal handler here cuz we want to set up the signal handlers asap.
+    // signal handler is applied to both script and interactive mode.
+    if (argc == 2) {
+        scriptMode(argv[1]);
+    } else {
+        interactiveMode();
+    }
+    return 0;
+    // program exits after script mode (return 0 = exit(0))
+    // thats why the scriptmode exits even without exit command in the file.
 }
