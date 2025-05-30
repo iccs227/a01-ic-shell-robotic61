@@ -1,3 +1,3 @@
-echo hello
-echo world
+echo script
 !!
+exit 7

@@ -1,3 +1,3 @@
 echo script running
 ls
-echo $?
+echo hello

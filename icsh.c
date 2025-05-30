@@ -9,36 +9,35 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #define MAX_CMD_BUFFER 255
-#define MAX_ARGS 128 // for number of arguments(external command)
+#define MAX_ARGS       128 // for number of arguments (external command)
 
-pid_t fg_pid = -1; // stores the PID of the child process(-1 is never a valid PID 
-//meaning no child process now)
-int last_status = 0;
-// for built-in commands we do not update last_statusm so it stays at 0.
-// only the child process will update the last_status.
+pid_t fg_pid = -1; // stores the PID of the foreground child (-1 if none)
+int   last_status = 0;  // exit status of last foreground process
 
 void handle_sigint(int sig) {
     if (fg_pid > 0) {
+        // if a child is running, forward SIGINT
         printf("\n");
         kill(fg_pid, SIGINT);
     }
-    else { // only print prompt if no child is running.
+    else {
+        // otherwise just reprint prompt
         printf("\nicsh $ ");
         fflush(stdout);
-        // After the signal handler runs, it resumes exactly where it was interrupted.
-        // so continues at fgets().
     }
-    // if signal sent and there is no child process we do nothing(go back to prompt).
 }
 
 void handle_sigtstp(int sig) {
     if (fg_pid > 0) {
+        // if a child is running, forward SIGTSTP
         printf("\n");
         kill(fg_pid, SIGTSTP);
     }
-    else { // only print prompt if no child is running.
+    else {
+        // otherwise just reprint prompt
         printf("\nicsh $ ");
         fflush(stdout);
     }
@@ -51,165 +50,217 @@ void prompt() {
 
 int handleHistory(char buffer[], char last_cmd[]) {
     if (strcmp(buffer, "!!") == 0) {
+        // repeat last command
         if (strlen(last_cmd) == 0) {
-            return 0; // no last command
-			// returns here are used for if statement in the program.
+            // no last command
+            return 0;
         }
         printf("%s\n", last_cmd);
         strcpy(buffer, last_cmd);
-    } 
+    }
     else if (strlen(buffer) > 0) {
+        // save new command
         strcpy(last_cmd, buffer);
     }
     return 1;
 }
 
 void runCmd(char *cmd, char last_cmd[], char buffer[]) {
-    if (strcmp(cmd, "echo") == 0) {
-        char *next = strtok(NULL, " ");
+    // parse tokens and I/O redirection 
+    char *tokens[MAX_ARGS];
+    char *infile = NULL;
+    char *outfile = NULL;
+    int   ntok = 0;
 
-        if (next && strcmp(next, "$?") == 0) {
-            printf("%d\n", last_status);
-            return; // exits the function early(does not return anything)
+    // first token is the command
+    tokens[ntok] = cmd;
+    ntok = ntok + 1;
+
+    char *t = strtok(NULL, " ");
+    while (t != NULL && ntok < MAX_ARGS - 1) {
+        if (strcmp(t, "<") == 0) {
+            // input redirection
+            t = strtok(NULL, " ");
+            if (t != NULL) {
+                infile = t;
+            }
+        }
+        else if (strcmp(t, ">") == 0) {
+            // output redirection
+            t = strtok(NULL, " ");
+            if (t != NULL) {
+                outfile = t;
+            }
+        }
+        else {
+            tokens[ntok] = t;
+            ntok = ntok + 1;
+        }
+        t = strtok(NULL, " ");
+    }
+    tokens[ntok] = NULL;
+
+    // built-in commands with parent-level redirection
+    int is_echo = (strcmp(cmd, "echo") == 0);
+    int is_exit = (strcmp(cmd, "exit") == 0);
+
+    if (is_echo == 1 || is_exit == 1) {
+        int saved_in  = -1;
+        int saved_out = -1;
+
+        // redirect input if requested
+        if (infile != NULL) {
+            saved_in = dup(STDIN_FILENO);
+            int fd = open(infile, O_RDONLY);
+            if (fd < 0) {
+                perror("open input");
+                goto restore;
+            }
+            dup2(fd, STDIN_FILENO);
+            close(fd);
+        }
+        // redirect output if requested
+        if (outfile != NULL) {
+            saved_out = dup(STDOUT_FILENO);
+            int fd = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                perror("open output");
+                goto restore;
+            }
+            dup2(fd, STDOUT_FILENO);
+            close(fd);
         }
 
-        while (next != NULL) {
-            printf("%s ", next);
-            next = strtok(NULL, " ");
+        // handle echo
+        if (is_echo == 1) {
+            char **args = tokens + 1;
+            if (args[0] != NULL && strcmp(args[0], "$?") == 0) {
+                // print last status
+                printf("%d\n", last_status);
+            }
+            else {
+                int i = 0;
+                while (args[i] != NULL) {
+                    printf("%s", args[i]);
+                    if (args[i + 1] != NULL) {
+                        printf(" ");
+                    }
+                    i = i + 1;
+                }
+                printf("\n");
+            }
         }
-        printf("\n");
+        else {
+            // handle exit
+            int code = 0;
+            if (tokens[1] != NULL) {
+                code = atoi(tokens[1]) & 0xFF;
+            }
+            printf("bye\n");
+            exit(code);
+        }
+
+    restore:
+        // restore fds
+        if (saved_out != -1) {
+            dup2(saved_out, STDOUT_FILENO);
+            close(saved_out);
+        }
+        if (saved_in  != -1) {
+            dup2(saved_in, STDIN_FILENO);
+            close(saved_in);
+        }
         return;
     }
 
-    if (strcmp(cmd, "exit") == 0) {
-        char *next = strtok(NULL, " ");
-        int exit_code = 0;
-        if (next != NULL) {
-            exit_code = atoi(next) & 0xFF;
-        }
-        printf("bye\n");
-        exit(exit_code);
-    }
-
-    // External command(replaced the bad command earlier)
-    char *args[MAX_ARGS]; // array of strings to keep argument lists, used to run execvp
-    int i = 0;
-    char *token = cmd; //from the interactive/script mode function
-    while(token != NULL && i < MAX_ARGS -1) {
-        args[i] = token;
-        i++;
-        token = strtok(NULL, " ");
-    }
-    args[i] = NULL; //use this to show NULL terminaation for the execvp
-    // execvp only looks until it sees NULL.
+    // external command: fork + child-level redirection
     pid_t pid = fork();
-
+    if (pid < 0) {
+        perror("failed to fork");
+        last_status = 1;
+        return;
+    }
     if (pid == 0) {
-        execvp(args[0], args);
-        // after execvp succeeds, the current process is gone.
-        // so no code after this will run unless execvp fails.
+        // child: apply redirection if needed
+        if (infile != NULL) {
+            int fd = open(infile, O_RDONLY);
+            if (fd < 0) {
+                perror("open input");
+                exit(1);
+            }
+            dup2(fd, STDIN_FILENO);
+            close(fd);
+        }
+        if (outfile != NULL) {
+            int fd = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                perror("open output");
+                exit(1);
+            }
+            dup2(fd, STDOUT_FILENO);
+            close(fd);
+        }
+        execvp(tokens[0], tokens);
         perror("failed to execute");
-        // prints the most recent failed error
         exit(1);
-        // exit with error
     }
-
-    else if (pid > 0) {
+    else {
+        // parent: wait for child
         fg_pid = pid;
-        // set 
         int status;
-        // stores an integer of how the child process terminates.
-        waitpid(pid, &status, WUNTRACED); // set instead of default to WUNTRACED.
-        // parent waits for child to either exit normally or get suspended.
-        // now the child stays suspended and parent gain control of the terminal.
-        // so prompt can return right away and dont have to wait for the 
-        // SUSPENDED child process.
-        // wait for the child process to finish to continue.
-        // use 0 for default behavior.
-
-        fg_pid = -1; // PREPARE TO CHANGE THIS to resume the child process.
-
-        // resets the fg_pid back to -1 after the child finishes(no more child process)
-
+        waitpid(pid, &status, WUNTRACED);
+        fg_pid = -1;
         if (WIFEXITED(status)) {
-            // true if the child exited normally
             last_status = WEXITSTATUS(status);
-            // returns the exit code of the child
         }
-
         else {
             last_status = 1;
         }
-
     }
-
-        else {
-            // for the case where fork returns -1, meaning the process creation failed.
-            perror("failed to fork");
-            last_status = 1;
-            // 1 means error.
-        }
-
 }
 
 void scriptMode(const char *filename) {
     char buffer[MAX_CMD_BUFFER];
     char last_cmd[MAX_CMD_BUFFER] = "";
     FILE *input = fopen(filename, "r");
-
     if (input == NULL) {
         printf("Could not open the file.\n");
         return;
     }
-
     while (fgets(buffer, MAX_CMD_BUFFER, input) != NULL) {
         buffer[strcspn(buffer, "\n")] = '\0';
         if (!handleHistory(buffer, last_cmd)) continue;
-
         char *cmd = strtok(buffer, " ");
         if (cmd == NULL) continue;
-
         runCmd(cmd, last_cmd, buffer);
     }
-
     fclose(input);
 }
 
 void interactiveMode() {
     char buffer[MAX_CMD_BUFFER];
     char last_cmd[MAX_CMD_BUFFER] = "";
-
     printf("Starting IC shell\n");
-
     while (1) {
         prompt();
         if (fgets(buffer, MAX_CMD_BUFFER, stdin) == NULL) {
             break;
         }
-
         buffer[strcspn(buffer, "\n")] = '\0';
         if (!handleHistory(buffer, last_cmd)) continue;
-		// handleHistory runs first then check the condtion.
-		// continue, for the case of !!, but no last command. (0! = 1 = true) back to prompt.
-
         char *cmd = strtok(buffer, " ");
         if (cmd == NULL) continue;
-
         runCmd(cmd, last_cmd, buffer);
     }
 }
 
 int main(int argc, char *argv[]) {
-    signal(SIGINT, handle_sigint);
+    signal(SIGINT,  handle_sigint);
     signal(SIGTSTP, handle_sigtstp);
-    // we put signal handler here cuz we want to set up the signal handlers asap.
-    // signal handler is applied to both script and interactive mode.
     if (argc == 2) {
         scriptMode(argv[1]);
     } else {
         interactiveMode();
     }
     return 0;
-    // program exits after script mode (return 0 = exit(0))
-    // thats why the scriptmode exits even without exit command in the file.
 }

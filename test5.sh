@@ -1,13 +1,3 @@
-echo first
-
-echo second
-
-
-
-
-
-
-
-
-
-
+echo script test
+ls
+exit 5
