@@ -1,6 +1,7 @@
-// icsh.c
-// Milestone 6: Background jobs & job control
-// I wrote this shell so I can run commands, send them to background, and control jobs.
+/* ICCS227: Project 1: icsh
+* Name: Ratchapong Tiebsornchai
+* StudentID: 6380164
+*/
 
 #include <stdio.h>
 #include <string.h>
